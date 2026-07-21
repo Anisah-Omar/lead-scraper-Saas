@@ -570,12 +570,13 @@ def render_workspace():
     with input_col2:
         location_city = st.text_input("Location City", placeholder="e.g. Nairobi")
 
-    result_limit = st.slider("Result limit", min_value=10, max_value=100, value=25, step=5)
-    if result_limit > VERCEL_SERVER_MAX_RESULTS:
-        st.caption(
-            f"⚠️ The extraction engine currently returns up to {VERCEL_SERVER_MAX_RESULTS} "
-            "verified leads per search — you may receive fewer than requested."
-        )
+    result_limit = st.slider(
+        "Result limit",
+        min_value=10,
+        max_value=VERCEL_SERVER_MAX_RESULTS,
+        value=VERCEL_SERVER_MAX_RESULTS,
+        step=5,
+    )
 
     st.markdown(
         f'<span class="lp-badge">Cost: 1 credit per extraction · Balance: {user_record["credits"]} credits</span>',
