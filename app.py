@@ -732,6 +732,14 @@ def render_wallet_sidebar():
         st.markdown("---")
         st.markdown('<div class="lp-section-title">💳 Top Up via M-Pesa</div>', unsafe_allow_html=True)
 
+        # Show the result of the last top-up attempt, if any. Stored in
+        # session_state (rather than shown immediately before a rerun) so
+        # the message — including real IntaSend error details — is actually
+        # visible instead of flashing and disappearing.
+        last_notice = st.session_state.pop("topup_notice", None)
+        if last_notice:
+            getattr(st, last_notice["level"])(last_notice["message"])
+
         if INTASEND_SANDBOX_TOKEN:
             st.caption(f"✅ Live IntaSend connection (key ends in ...{INTASEND_SANDBOX_TOKEN[-4:]})")
         else:
@@ -750,7 +758,11 @@ def render_wallet_sidebar():
 
         if st.button("📲 Send STK Push"):
             if not phone_input or not phone_input.strip():
-                st.error("Please enter a valid M-Pesa phone number.")
+                st.session_state["topup_notice"] = {
+                    "level": "error",
+                    "message": "Please enter a valid M-Pesa phone number.",
+                }
+                st.rerun()
             else:
                 bundle = CREDIT_BUNDLES[selected_bundle_label]
                 normalized = normalize_kenyan_phone(phone_input)
@@ -768,14 +780,18 @@ def render_wallet_sidebar():
                         mark_transaction_complete_locally(
                             api_ref, st.session_state.current_user, bundle["credits"]
                         )
-                        st.success(result["message"])
-                        st.balloons()
-                        st.rerun()
+                        st.session_state["topup_notice"] = {"level": "warning", "message": result["message"]}
+                        st.session_state["show_balloons"] = True
                     else:
                         st.session_state["pending_api_ref"] = api_ref
-                        st.info(result["message"])
+                        st.session_state["topup_notice"] = {"level": "info", "message": result["message"]}
                 else:
-                    st.error(result["message"])
+                    st.session_state["topup_notice"] = {"level": "error", "message": result["message"]}
+
+                st.rerun()
+
+        if st.session_state.pop("show_balloons", False):
+            st.balloons()
 
         # If a real (non-demo) payment is awaiting webhook confirmation,
         # show its live status and let the user manually refresh.
