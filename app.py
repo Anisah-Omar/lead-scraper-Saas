@@ -25,9 +25,10 @@ VERCEL_API_BASE_URL = "https://business-lead-scraper.vercel.app"
 VERCEL_LEADS_ENDPOINT = f"{VERCEL_API_BASE_URL}/scrape-leads"
 VERCEL_SERVER_MAX_RESULTS = 20  # hard cap enforced by the backend's MAX_RESULTS constant
 
-INTASEND_SANDBOX_URL = "https://intasend.com/api/v1/payment/mpesa-stk-push/"
-INTASEND_SANDBOX_PUBLIC_KEY = "ISPubKey_test_00000000-0000-0000-0000-000000000000"
-INTASEND_SANDBOX_TOKEN = ""  # Populate with a real sandbox/live token before going to production
+INTASEND_SANDBOX_URL = "https://sandbox.intasend.com/api/v1/payment/collection/"
+# When you go live, switch to: "https://payment.intasend.com/api/v1/payment/collection/"
+INTASEND_SANDBOX_PUBLIC_KEY = st.secrets["intasend"]["public_key"]
+INTASEND_SANDBOX_TOKEN = st.secrets["intasend"]["secret_key"]
 
 # When True, a missing/failed IntaSend call is simulated locally and credits
 # land immediately. This is ONLY safe for demos — real production traffic
@@ -449,17 +450,17 @@ def normalize_kenyan_phone(raw_phone: str) -> str:
     return cleaned
 
 
-def send_mpesa_stk_push(phone: str, amount: int, api_ref: str):
+def send_mpesa_stk_push(phone: str, amount: int, api_ref: str, customer_email: str):
     """
     Trigger an M-Pesa STK push via the IntaSend sandbox/live endpoint for a
     specific pending transaction (api_ref). This function ONLY sends the
     prompt — it never credits the wallet. Crediting happens exclusively when
     IntaSend confirms payment via the backend's /mpesa/webhook route.
 
-    The webhook callback URL is configured once in your IntaSend dashboard
-    settings (Settings -> API -> Webhooks), pointed at:
+    The webhook callback URL and its "challenge" value are configured once
+    in your IntaSend dashboard under Webhooks -> Add destination URL:
         https://business-lead-scraper.vercel.app/mpesa/webhook
-    It is NOT passed per-request.
+    They are NOT passed per-request.
     """
     normalized_phone = normalize_kenyan_phone(phone)
 
@@ -485,12 +486,17 @@ def send_mpesa_stk_push(phone: str, amount: int, api_ref: str):
         "Authorization": f"Bearer {INTASEND_SANDBOX_TOKEN}",
         "Content-Type": "application/json",
     }
+    # IntaSend's collection API requires all of these fields — omitting any
+    # of them (currency, method, name, email) causes the request to fail.
     payload = {
         "public_key": INTASEND_SANDBOX_PUBLIC_KEY,
-        "amount": amount,
-        "phone_number": normalized_phone,
         "currency": "KES",
+        "method": "M-PESA",
+        "amount": amount,
         "api_ref": api_ref,
+        "phone_number": normalized_phone,
+        "name": customer_email.split("@")[0],
+        "email": customer_email,
     }
 
     try:
@@ -503,6 +509,17 @@ def send_mpesa_stk_push(phone: str, amount: int, api_ref: str):
             "demo_credited": False,
             "message": "STK push sent. Check your phone and enter your M-Pesa PIN to complete payment. Your credits will appear automatically once confirmed.",
         }
+    except requests.exceptions.HTTPError as http_error:
+        # Surface IntaSend's actual error body — it usually explains exactly
+        # which field was wrong or missing, which a generic message hides.
+        error_detail = http_error.response.text if http_error.response is not None else str(http_error)
+        if DEMO_MODE:
+            return {
+                "success": True,
+                "demo_credited": True,
+                "message": f"Sandbox fallback triggered (IntaSend rejected the request: {error_detail}). Credits applied for demo continuity only.",
+            }
+        return {"success": False, "message": f"Payment provider rejected the request: {error_detail}"}
     except requests.exceptions.RequestException as request_error:
         if DEMO_MODE:
             return {
@@ -631,7 +648,7 @@ def render_signup_form():
         confirm_password = st.text_input(
             "Confirm password", type="password", placeholder="Re-enter password", key="signup_pw_confirm"
         )
-        submitted = st.form_submit_button("✨ Create Account")
+        submitted = st.form_submit_button("✨ Create Free Account")
 
         if submitted:
             email_clean = (new_email or "").strip().lower()
@@ -731,7 +748,9 @@ def render_wallet_sidebar():
                 )
 
                 with st.spinner("Sending STK push to your phone..."):
-                    result = send_mpesa_stk_push(phone_input, bundle["amount"], api_ref)
+                    result = send_mpesa_stk_push(
+                        phone_input, bundle["amount"], api_ref, st.session_state.current_user
+                    )
 
                 if result["success"]:
                     if result.get("demo_credited"):
