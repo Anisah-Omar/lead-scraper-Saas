@@ -3,7 +3,10 @@ import pandas as pd
 import requests
 import hashlib
 import re
+import uuid
 from datetime import datetime
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 # ==============================================================================
 # PAGE CONFIGURATION
@@ -24,7 +27,14 @@ VERCEL_SERVER_MAX_RESULTS = 20  # hard cap enforced by the backend's MAX_RESULTS
 
 INTASEND_SANDBOX_URL = "https://intasend.com/api/v1/payment/mpesa-stk-push/"
 INTASEND_SANDBOX_PUBLIC_KEY = "ISPubKey_test_00000000-0000-0000-0000-000000000000"
-INTASEND_SANDBOX_TOKEN = ""  # Populate with a real sandbox token in production
+INTASEND_SANDBOX_TOKEN = ""  # Populate with a real sandbox/live token before going to production
+
+# When True, a missing/failed IntaSend call is simulated locally and credits
+# land immediately. This is ONLY safe for demos — real production traffic
+# must rely on the /mpesa/webhook confirmation in the backend instead.
+# Set this to False once INTASEND_SANDBOX_TOKEN is a real token and the
+# webhook is wired up in the IntaSend dashboard.
+DEMO_MODE = True
 
 CREDIT_BUNDLES = {
     "Starter Bundle — 100 Credits (KES 500)": {"credits": 100, "amount": 500},
@@ -55,7 +65,6 @@ CUSTOM_CSS = """
         max-width: 1200px;
     }
 
-    /* Card module */
     .lp-card {
         background-color: #ffffff;
         border-radius: 14px;
@@ -123,6 +132,18 @@ CUSTOM_CSS = """
         display: inline-block;
         background-color: #eef2ff;
         color: #4338ca;
+        font-size: 0.72rem;
+        font-weight: 700;
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+
+    .lp-pending-badge {
+        display: inline-block;
+        background-color: #fffbeb;
+        color: #b45309;
         font-size: 0.72rem;
         font-weight: 700;
         padding: 0.2rem 0.6rem;
@@ -211,6 +232,64 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ==============================================================================
+# DATABASE CONNECTION
+# ==============================================================================
+# Requires a [connections.db] section in .streamlit/secrets.toml, e.g.:
+#
+# [connections.db]
+# url = "postgresql://user:password@host:5432/dbname"
+#
+# Any Postgres works (Supabase, Neon, Railway, RDS...) as long as the SAME
+# connection string is also used by the FastAPI backend's webhook handler,
+# since both processes must read/write the same tables.
+db = st.connection("db", type="sql")
+
+
+def init_database():
+    """Create tables if they don't exist yet and seed the two demo accounts."""
+    with db.session as session:
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                phone TEXT UNIQUE,
+                credits INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                api_ref TEXT UNIQUE NOT NULL,
+                email TEXT NOT NULL REFERENCES users(email),
+                bundle_credits INTEGER NOT NULL,
+                amount_kes INTEGER NOT NULL,
+                phone TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMP
+            )
+        """))
+        session.commit()
+
+        # Seed demo accounts (idempotent — skipped if they already exist)
+        demo_accounts = [
+            {"email": "test@leadpulse.com", "password_hash": hash_password("password123"), "credits": 5},
+            {"email": "agency@marketing.co.ke", "password_hash": hash_password("grow2026"), "credits": 120},
+        ]
+        for account in demo_accounts:
+            session.execute(
+                text("""
+                    INSERT INTO users (email, password_hash, credits)
+                    VALUES (:email, :password_hash, :credits)
+                    ON CONFLICT (email) DO NOTHING
+                """),
+                account,
+            )
+        session.commit()
+
+
+# ==============================================================================
 # PASSWORD HASHING HELPERS
 # ==============================================================================
 def hash_password(raw_password: str) -> str:
@@ -223,39 +302,131 @@ def verify_password(raw_password: str, hashed_password: str) -> bool:
     return hash_password(raw_password) == hashed_password
 
 
+init_database()
+
 # ==============================================================================
-# SESSION-STATE "DATABASE" INITIALIZATION
+# SESSION STATE (holds only the CURRENT session's identity — never balances)
 # ==============================================================================
-def init_user_database():
-    if "user_db" not in st.session_state:
-        st.session_state.user_db = {
-            "test@leadpulse.com": {
-                "password_hash": hash_password("password123"),
-                "credits": 5,
-                "created_at": "2026-01-01",
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
+if "last_results" not in st.session_state:
+    st.session_state.last_results = None
+
+
+# ==============================================================================
+# DATABASE HELPERS — USERS
+# ==============================================================================
+def get_user(email: str):
+    result = db.query(
+        "SELECT email, password_hash, phone, credits FROM users WHERE email = :email",
+        params={"email": email},
+        ttl=0,
+    )
+    if result.empty:
+        return None
+    return result.iloc[0].to_dict()
+
+
+def get_user_credits(email: str) -> int:
+    user = get_user(email)
+    return int(user["credits"]) if user else 0
+
+
+def create_user(email: str, password: str, phone: str) -> tuple[bool, str]:
+    """
+    Create a new user with a 3-credit free trial. The phone number must be
+    unique across all accounts, which prevents the same person from farming
+    unlimited free trials just by signing up with a new email address.
+    """
+    try:
+        with db.session as session:
+            session.execute(
+                text("""
+                    INSERT INTO users (email, password_hash, phone, credits)
+                    VALUES (:email, :password_hash, :phone, 3)
+                """),
+                {"email": email, "password_hash": hash_password(password), "phone": phone},
+            )
+            session.commit()
+        return True, "Account created."
+    except IntegrityError as exc:
+        error_text = str(exc).lower()
+        if "phone" in error_text:
+            return False, "This phone number has already claimed a free trial. Please log in or top up instead."
+        return False, "An account with that email already exists."
+
+
+def adjust_credits(email: str, delta: int):
+    with db.session as session:
+        session.execute(
+            text("UPDATE users SET credits = credits + :delta WHERE email = :email"),
+            {"delta": delta, "email": email},
+        )
+        session.commit()
+
+
+# ==============================================================================
+# DATABASE HELPERS — TRANSACTIONS (M-PESA / INTASEND)
+# ==============================================================================
+def create_pending_transaction(email: str, phone: str, bundle_credits: int, amount_kes: int) -> str:
+    api_ref = f"leadpulse-{uuid.uuid4().hex[:16]}"
+    with db.session as session:
+        session.execute(
+            text("""
+                INSERT INTO transactions (api_ref, email, bundle_credits, amount_kes, phone, status)
+                VALUES (:api_ref, :email, :bundle_credits, :amount_kes, :phone, 'PENDING')
+            """),
+            {
+                "api_ref": api_ref,
+                "email": email,
+                "bundle_credits": bundle_credits,
+                "amount_kes": amount_kes,
+                "phone": phone,
             },
-            "agency@marketing.co.ke": {
-                "password_hash": hash_password("grow2026"),
-                "credits": 120,
-                "created_at": "2026-01-01",
-            },
-        }
-
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
-    if "current_user" not in st.session_state:
-        st.session_state.current_user = None
-
-    if "last_results" not in st.session_state:
-        st.session_state.last_results = None
+        )
+        session.commit()
+    return api_ref
 
 
-init_user_database()
+def get_transaction_status(api_ref: str) -> str:
+    result = db.query(
+        "SELECT status FROM transactions WHERE api_ref = :api_ref",
+        params={"api_ref": api_ref},
+        ttl=0,
+    )
+    if result.empty:
+        return "UNKNOWN"
+    return result.iloc[0]["status"]
+
+
+def mark_transaction_complete_locally(api_ref: str, email: str, bundle_credits: int):
+    """
+    DEMO-ONLY helper: marks a transaction complete and credits the wallet
+    without a real webhook confirmation. Only ever called when DEMO_MODE is
+    True and the IntaSend call could not be completed for real. In
+    production (DEMO_MODE = False) this path is never used — crediting is
+    the backend webhook's job, triggered only by a confirmed IntaSend event.
+    """
+    with db.session as session:
+        session.execute(
+            text("""
+                UPDATE transactions
+                SET status = 'COMPLETE', completed_at = NOW()
+                WHERE api_ref = :api_ref AND status = 'PENDING'
+            """),
+            {"api_ref": api_ref},
+        )
+        session.execute(
+            text("UPDATE users SET credits = credits + :delta WHERE email = :email"),
+            {"delta": bundle_credits, "email": email},
+        )
+        session.commit()
 
 
 # ==============================================================================
-# M-PESA / INTASEND SANDBOX HELPER
+# M-PESA / INTASEND STK PUSH
 # ==============================================================================
 def normalize_kenyan_phone(raw_phone: str) -> str:
     """
@@ -278,27 +449,36 @@ def normalize_kenyan_phone(raw_phone: str) -> str:
     return cleaned
 
 
-def send_mpesa_stk_push(phone: str, amount: int):
+def send_mpesa_stk_push(phone: str, amount: int, api_ref: str):
     """
-    Trigger an M-Pesa STK push via the IntaSend sandbox endpoint.
-    Returns a dict describing the outcome. Falls back gracefully to a
-    simulated sandbox success if the API token is missing or the live
-    request fails, so demos are never blocked.
+    Trigger an M-Pesa STK push via the IntaSend sandbox/live endpoint for a
+    specific pending transaction (api_ref). This function ONLY sends the
+    prompt — it never credits the wallet. Crediting happens exclusively when
+    IntaSend confirms payment via the backend's /mpesa/webhook route.
+
+    The webhook callback URL is configured once in your IntaSend dashboard
+    settings (Settings -> API -> Webhooks), pointed at:
+        https://business-lead-scraper.vercel.app/mpesa/webhook
+    It is NOT passed per-request.
     """
     normalized_phone = normalize_kenyan_phone(phone)
 
     if not re.match(r"^2547\d{8}$", normalized_phone):
         return {
             "success": False,
-            "simulated": False,
             "message": "Invalid Kenyan phone number format. Use 07XXXXXXXX or +2547XXXXXXXX.",
         }
 
     if not INTASEND_SANDBOX_TOKEN:
+        if DEMO_MODE:
+            return {
+                "success": True,
+                "demo_credited": True,
+                "message": f"Demo mode: STK push simulated for {normalized_phone} (KES {amount}). Credits applied instantly for demo purposes only.",
+            }
         return {
-            "success": True,
-            "simulated": True,
-            "message": f"Sandbox mode: STK push simulated for {normalized_phone} (KES {amount}).",
+            "success": False,
+            "message": "Payment provider is not configured. Please contact support.",
         }
 
     headers = {
@@ -310,7 +490,7 @@ def send_mpesa_stk_push(phone: str, amount: int):
         "amount": amount,
         "phone_number": normalized_phone,
         "currency": "KES",
-        "api_ref": f"leadpulse-{datetime.utcnow().isoformat()}",
+        "api_ref": api_ref,
     }
 
     try:
@@ -318,31 +498,38 @@ def send_mpesa_stk_push(phone: str, amount: int):
             INTASEND_SANDBOX_URL, json=payload, headers=headers, timeout=15
         )
         response.raise_for_status()
-        data = response.json()
         return {
             "success": True,
-            "simulated": False,
-            "message": "STK push sent successfully. Check your phone to complete payment.",
-            "raw_response": data,
+            "demo_credited": False,
+            "message": "STK push sent. Check your phone and enter your M-Pesa PIN to complete payment. Your credits will appear automatically once confirmed.",
         }
     except requests.exceptions.RequestException as request_error:
+        if DEMO_MODE:
+            return {
+                "success": True,
+                "demo_credited": True,
+                "message": f"Sandbox fallback triggered ({request_error}). Credits applied for demo continuity only.",
+            }
         return {
-            "success": True,
-            "simulated": True,
-            "message": f"Sandbox fallback triggered ({request_error}). Credits applied for demo continuity.",
+            "success": False,
+            "message": f"Could not reach the payment provider: {request_error}",
         }
     except ValueError as parse_error:
-        return {
-            "success": True,
-            "simulated": True,
-            "message": f"Sandbox fallback triggered (bad response payload: {parse_error}).",
-        }
+        if DEMO_MODE:
+            return {
+                "success": True,
+                "demo_credited": True,
+                "message": f"Sandbox fallback triggered (bad response payload: {parse_error}).",
+            }
+        return {"success": False, "message": f"Payment provider returned an unreadable response: {parse_error}"}
     except Exception as unexpected_error:
-        return {
-            "success": True,
-            "simulated": True,
-            "message": f"Sandbox fallback triggered (unexpected error: {unexpected_error}).",
-        }
+        if DEMO_MODE:
+            return {
+                "success": True,
+                "demo_credited": True,
+                "message": f"Sandbox fallback triggered (unexpected error: {unexpected_error}).",
+            }
+        return {"success": False, "message": f"Unexpected payment error: {unexpected_error}"}
 
 
 # ==============================================================================
@@ -421,7 +608,7 @@ def render_login_form():
 
         if submitted:
             email_clean = (email or "").strip().lower()
-            user_record = st.session_state.user_db.get(email_clean)
+            user_record = get_user(email_clean)
 
             if not user_record:
                 st.error("No account found with that email address.")
@@ -437,36 +624,37 @@ def render_login_form():
 def render_signup_form():
     with st.form("signup_form", clear_on_submit=False):
         new_email = st.text_input("Email address", placeholder="you@company.com", key="signup_email")
+        new_phone = st.text_input("M-Pesa phone number", placeholder="07XX XXX XXX or +2547XXXXXXXX", key="signup_phone")
         new_password = st.text_input(
             "Create password", type="password", placeholder="Minimum 6 characters", key="signup_pw"
         )
         confirm_password = st.text_input(
             "Confirm password", type="password", placeholder="Re-enter password", key="signup_pw_confirm"
         )
-        submitted = st.form_submit_button("✨ Create Free Account")
+        submitted = st.form_submit_button("✨ Create Account")
 
         if submitted:
             email_clean = (new_email or "").strip().lower()
+            normalized_phone = normalize_kenyan_phone(new_phone)
 
             if not email_clean or "@" not in email_clean or "." not in email_clean:
                 st.error("Please enter a valid email address.")
-            elif email_clean in st.session_state.user_db:
-                st.error("An account with that email already exists. Please log in instead.")
+            elif not re.match(r"^2547\d{8}$", normalized_phone):
+                st.error("Please enter a valid Kenyan phone number (e.g. 07XXXXXXXX).")
             elif len(new_password or "") < 6:
                 st.error("Password must be at least 6 characters long.")
             elif new_password != confirm_password:
                 st.error("Passwords do not match. Please try again.")
             else:
-                st.session_state.user_db[email_clean] = {
-                    "password_hash": hash_password(new_password),
-                    "credits": 3,
-                    "created_at": datetime.utcnow().strftime("%Y-%m-%d"),
-                }
-                st.session_state.authenticated = True
-                st.session_state.current_user = email_clean
-                st.success("Account created! You've received 3 free trial credits.")
-                st.balloons()
-                st.rerun()
+                created, message = create_user(email_clean, new_password, normalized_phone)
+                if not created:
+                    st.error(message)
+                else:
+                    st.session_state.authenticated = True
+                    st.session_state.current_user = email_clean
+                    st.success("Account created! You've received 3 free trial credits.")
+                    st.balloons()
+                    st.rerun()
 
 
 def render_auth_gate():
@@ -496,7 +684,7 @@ def render_auth_gate():
 # WALLET + BILLING SIDEBAR
 # ==============================================================================
 def render_wallet_sidebar():
-    user_record = st.session_state.user_db[st.session_state.current_user]
+    current_credits = get_user_credits(st.session_state.current_user)
 
     with st.sidebar:
         st.markdown(
@@ -505,7 +693,7 @@ def render_wallet_sidebar():
                 <div class="lp-wallet-label">Signed in as</div>
                 <div style="font-size:0.95rem; font-weight:600; margin-bottom:0.9rem;">{st.session_state.current_user}</div>
                 <div class="lp-wallet-label">Available Credits</div>
-                <div class="lp-wallet-value">{user_record['credits']}</div>
+                <div class="lp-wallet-value">{current_credits}</div>
                 <div class="lp-wallet-caption">1 credit = 1 lead extraction</div>
             </div>
             """,
@@ -537,23 +725,52 @@ def render_wallet_sidebar():
                 st.error("Please enter a valid M-Pesa phone number.")
             else:
                 bundle = CREDIT_BUNDLES[selected_bundle_label]
+                normalized = normalize_kenyan_phone(phone_input)
+                api_ref = create_pending_transaction(
+                    st.session_state.current_user, normalized, bundle["credits"], bundle["amount"]
+                )
+
                 with st.spinner("Sending STK push to your phone..."):
-                    result = send_mpesa_stk_push(phone_input, bundle["amount"])
+                    result = send_mpesa_stk_push(phone_input, bundle["amount"], api_ref)
 
                 if result["success"]:
-                    st.session_state.user_db[st.session_state.current_user]["credits"] += bundle["credits"]
-                    st.success(result["message"])
-                    st.balloons()
-                    st.rerun()
+                    if result.get("demo_credited"):
+                        mark_transaction_complete_locally(
+                            api_ref, st.session_state.current_user, bundle["credits"]
+                        )
+                        st.success(result["message"])
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        st.session_state["pending_api_ref"] = api_ref
+                        st.info(result["message"])
                 else:
                     st.error(result["message"])
+
+        # If a real (non-demo) payment is awaiting webhook confirmation,
+        # show its live status and let the user manually refresh.
+        pending_ref = st.session_state.get("pending_api_ref")
+        if pending_ref:
+            status = get_transaction_status(pending_ref)
+            if status == "PENDING":
+                st.markdown('<span class="lp-pending-badge">⏳ Payment pending confirmation</span>', unsafe_allow_html=True)
+                if st.button("🔄 Refresh payment status"):
+                    st.rerun()
+            elif status == "COMPLETE":
+                st.success("Payment confirmed — credits added!")
+                del st.session_state["pending_api_ref"]
+                st.balloons()
+                st.rerun()
+            elif status == "FAILED":
+                st.error("Payment failed or was cancelled. Please try again.")
+                del st.session_state["pending_api_ref"]
 
 
 # ==============================================================================
 # MAIN WORKSPACE
 # ==============================================================================
 def render_workspace():
-    user_record = st.session_state.user_db[st.session_state.current_user]
+    current_credits = get_user_credits(st.session_state.current_user)
 
     st.markdown('<div class="lp-header-title">📡 LeadPulse Workspace</div>', unsafe_allow_html=True)
     st.markdown(
@@ -579,7 +796,7 @@ def render_workspace():
     )
 
     st.markdown(
-        f'<span class="lp-badge">Cost: 1 credit per extraction · Balance: {user_record["credits"]} credits</span>',
+        f'<span class="lp-badge">Cost: 1 credit per extraction · Balance: {current_credits} credits</span>',
         unsafe_allow_html=True,
     )
     st.write("")
@@ -592,7 +809,7 @@ def render_workspace():
             st.warning("Please enter a keyword to search.")
         elif not location_city or not location_city.strip():
             st.warning("Please enter a target location city.")
-        elif user_record["credits"] < 1:
+        elif current_credits < 1:
             st.error("You're out of credits. Please top up via M-Pesa in the sidebar to continue.")
         else:
             with st.spinner("Extracting leads from the LeadPulse engine..."):
@@ -605,7 +822,7 @@ def render_workspace():
             elif leads_df is None or leads_df.empty:
                 st.info("No leads were found for that search. Try a broader keyword or location.")
             else:
-                st.session_state.user_db[st.session_state.current_user]["credits"] -= 1
+                adjust_credits(st.session_state.current_user, -1)
                 st.session_state.last_results = leads_df
                 st.success(f"Extraction complete — {len(leads_df)} leads retrieved. 1 credit deducted.")
                 st.rerun()
