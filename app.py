@@ -27,8 +27,14 @@ VERCEL_SERVER_MAX_RESULTS = 20  # hard cap enforced by the backend's MAX_RESULTS
 
 INTASEND_SANDBOX_URL = "https://sandbox.intasend.com/api/v1/payment/collection/"
 # When you go live, switch to: "https://payment.intasend.com/api/v1/payment/collection/"
-INTASEND_SANDBOX_PUBLIC_KEY = st.secrets["intasend"]["public_key"]
-INTASEND_SANDBOX_TOKEN = st.secrets["intasend"]["secret_key"]
+INTASEND_SANDBOX_PUBLIC_KEY = st.secrets.get("intasend", {}).get(
+    "public_key", "ISPubKey_test_00000000-0000-0000-0000-000000000000"
+)
+INTASEND_SANDBOX_TOKEN = st.secrets.get("intasend", {}).get("secret_key", "")
+# Populate the [intasend] block in secrets.toml with your real sandbox/live
+# keys before going to production. Until then this falls back to a
+# placeholder public key and an empty secret key, which keeps DEMO_MODE
+# working instead of crashing the app.
 
 # When True, a missing/failed IntaSend call is simulated locally and credits
 # land immediately. This is ONLY safe for demos — real production traffic
