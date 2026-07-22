@@ -732,6 +732,11 @@ def render_wallet_sidebar():
         st.markdown("---")
         st.markdown('<div class="lp-section-title">💳 Top Up via M-Pesa</div>', unsafe_allow_html=True)
 
+        if INTASEND_SANDBOX_TOKEN:
+            st.caption(f"✅ Live IntaSend connection (key ends in ...{INTASEND_SANDBOX_TOKEN[-4:]})")
+        else:
+            st.caption("⚠️ No IntaSend secret key loaded — running in DEMO_MODE (instant fake credit, no real charge).")
+
         selected_bundle_label = st.selectbox(
             "Choose a credit bundle",
             options=list(CREDIT_BUNDLES.keys()),
