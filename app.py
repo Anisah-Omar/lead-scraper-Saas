@@ -44,6 +44,10 @@ INTASEND_SANDBOX_TOKEN = st.secrets.get("intasend", {}).get("secret_key", "")
 DEMO_MODE = False
 
 CREDIT_BUNDLES = {
+    # TEMPORARY — remove this line before sending the app to real clients.
+    # Exists only to let you complete one real, cheap, end-to-end payment
+    # test through IntaSend without needing KES 500+ in your account.
+    "🧪 Test Bundle — 1 Credit (KES 1)": {"credits": 1, "amount": 1},
     "Starter Bundle — 100 Credits (KES 500)": {"credits": 100, "amount": 500},
     "Growth Bundle — 500 Credits (KES 1,500)": {"credits": 500, "amount": 1500},
     "Agency Pro Layer — 2,000 Credits (KES 4,500)": {"credits": 2000, "amount": 4500},
