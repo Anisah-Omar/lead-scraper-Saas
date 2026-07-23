@@ -43,11 +43,9 @@ INTASEND_SANDBOX_TOKEN = st.secrets.get("intasend", {}).get("secret_key", "")
 # webhook is wired up in the IntaSend dashboard.
 DEMO_MODE = False
 
+POCHI_LA_BIASHARA_NUMBER = "0796011042"
+
 CREDIT_BUNDLES = {
-    # TEMPORARY — remove this line before sending the app to real clients.
-    # Exists only to let you complete one real, cheap, end-to-end payment
-    # test through IntaSend without needing KES 500+ in your account.
-    "🧪 Test Bundle — 1 Credit (KES 10)": {"credits": 1, "amount": 10},
     "Starter Bundle — 100 Credits (KES 500)": {"credits": 100, "amount": 500},
     "Growth Bundle — 500 Credits (KES 1,500)": {"credits": 500, "amount": 1500},
     "Agency Pro Layer — 2,000 Credits (KES 4,500)": {"credits": 2000, "amount": 4500},
@@ -281,6 +279,10 @@ def init_database():
                 completed_at TIMESTAMP
             )
         """))
+        # Additive migration: safe to run every startup, no-op if it already exists.
+        session.execute(text("""
+            ALTER TABLE transactions ADD COLUMN IF NOT EXISTS mpesa_code TEXT
+        """))
         session.commit()
 
         # Seed demo accounts (idempotent — skipped if they already exist)
@@ -381,13 +383,15 @@ def adjust_credits(email: str, delta: int):
 # ==============================================================================
 # DATABASE HELPERS — TRANSACTIONS (M-PESA / INTASEND)
 # ==============================================================================
-def create_pending_transaction(email: str, phone: str, bundle_credits: int, amount_kes: int) -> str:
+def create_pending_transaction(
+    email: str, phone: str, bundle_credits: int, amount_kes: int, mpesa_code: str = None
+) -> str:
     api_ref = f"leadpulse-{uuid.uuid4().hex[:16]}"
     with db.session as session:
         session.execute(
             text("""
-                INSERT INTO transactions (api_ref, email, bundle_credits, amount_kes, phone, status)
-                VALUES (:api_ref, :email, :bundle_credits, :amount_kes, :phone, 'PENDING')
+                INSERT INTO transactions (api_ref, email, bundle_credits, amount_kes, phone, status, mpesa_code)
+                VALUES (:api_ref, :email, :bundle_credits, :amount_kes, :phone, 'PENDING', :mpesa_code)
             """),
             {
                 "api_ref": api_ref,
@@ -395,6 +399,7 @@ def create_pending_transaction(email: str, phone: str, bundle_credits: int, amou
                 "bundle_credits": bundle_credits,
                 "amount_kes": amount_kes,
                 "phone": phone,
+                "mpesa_code": mpesa_code,
             },
         )
         session.commit()
@@ -736,83 +741,83 @@ def render_wallet_sidebar():
         st.markdown("---")
         st.markdown('<div class="lp-section-title">💳 Top Up via M-Pesa</div>', unsafe_allow_html=True)
 
-        # Show the result of the last top-up attempt, if any. Stored in
-        # session_state (rather than shown immediately before a rerun) so
-        # the message — including real IntaSend error details — is actually
-        # visible instead of flashing and disappearing.
+        # Show the result of the last top-up submission, if any. Stored in
+        # session_state so it survives the rerun instead of vanishing.
         last_notice = st.session_state.pop("topup_notice", None)
         if last_notice:
             getattr(st, last_notice["level"])(last_notice["message"])
-
-        if INTASEND_SANDBOX_TOKEN:
-            st.caption(f"✅ Live IntaSend connection (key ends in ...{INTASEND_SANDBOX_TOKEN[-4:]})")
-        else:
-            st.caption("⚠️ No IntaSend secret key loaded — running in DEMO_MODE (instant fake credit, no real charge).")
 
         selected_bundle_label = st.selectbox(
             "Choose a credit bundle",
             options=list(CREDIT_BUNDLES.keys()),
             key="bundle_select",
         )
+        bundle = CREDIT_BUNDLES[selected_bundle_label]
+
+        st.markdown(
+            f"""
+            **How to pay:**
+            1. Open M-Pesa → **Lipa na M-Pesa** → **Pochi la Biashara**
+            2. Enter Till Number: **{POCHI_LA_BIASHARA_NUMBER}**
+            3. Enter amount: **KES {bundle['amount']}**
+            4. Complete with your M-Pesa PIN
+            5. Enter the confirmation code from your M-Pesa SMS below
+            """
+        )
+
         phone_input = st.text_input(
-            "M-Pesa phone number",
+            "Your M-Pesa phone number",
             placeholder="07XX XXX XXX or +2547XXXXXXXX",
             key="mpesa_phone",
         )
+        mpesa_code_input = st.text_input(
+            "M-Pesa confirmation code",
+            placeholder="e.g. QGH7XXXXX",
+            key="mpesa_code",
+        )
 
-        if st.button("📲 Send STK Push"):
-            if not phone_input or not phone_input.strip():
+        if st.button("✅ Submit Payment for Verification"):
+            normalized = normalize_kenyan_phone(phone_input) if phone_input else ""
+            code_clean = (mpesa_code_input or "").strip().upper()
+
+            if not re.match(r"^2547\d{8}$", normalized):
                 st.session_state["topup_notice"] = {
                     "level": "error",
                     "message": "Please enter a valid M-Pesa phone number.",
                 }
-                st.rerun()
+            elif not code_clean or len(code_clean) < 6:
+                st.session_state["topup_notice"] = {
+                    "level": "error",
+                    "message": "Please enter the M-Pesa confirmation code from your SMS.",
+                }
             else:
-                bundle = CREDIT_BUNDLES[selected_bundle_label]
-                normalized = normalize_kenyan_phone(phone_input)
                 api_ref = create_pending_transaction(
-                    st.session_state.current_user, normalized, bundle["credits"], bundle["amount"]
+                    st.session_state.current_user, normalized, bundle["credits"], bundle["amount"], code_clean
                 )
+                st.session_state["pending_api_ref"] = api_ref
+                st.session_state["topup_notice"] = {
+                    "level": "info",
+                    "message": "Payment submitted! We'll verify it against your M-Pesa code and add your credits shortly — usually within a few minutes.",
+                }
 
-                with st.spinner("Sending STK push to your phone..."):
-                    result = send_mpesa_stk_push(
-                        phone_input, bundle["amount"], api_ref, st.session_state.current_user
-                    )
+            st.rerun()
 
-                if result["success"]:
-                    if result.get("demo_credited"):
-                        mark_transaction_complete_locally(
-                            api_ref, st.session_state.current_user, bundle["credits"]
-                        )
-                        st.session_state["topup_notice"] = {"level": "warning", "message": result["message"]}
-                        st.session_state["show_balloons"] = True
-                    else:
-                        st.session_state["pending_api_ref"] = api_ref
-                        st.session_state["topup_notice"] = {"level": "info", "message": result["message"]}
-                else:
-                    st.session_state["topup_notice"] = {"level": "error", "message": result["message"]}
-
-                st.rerun()
-
-        if st.session_state.pop("show_balloons", False):
-            st.balloons()
-
-        # If a real (non-demo) payment is awaiting webhook confirmation,
-        # show its live status and let the user manually refresh.
+        # Show status of the most recently submitted payment, and let the
+        # user manually refresh once the owner has verified it in Supabase.
         pending_ref = st.session_state.get("pending_api_ref")
         if pending_ref:
             status = get_transaction_status(pending_ref)
             if status == "PENDING":
-                st.markdown('<span class="lp-pending-badge">⏳ Payment pending confirmation</span>', unsafe_allow_html=True)
+                st.markdown('<span class="lp-pending-badge">⏳ Awaiting manual verification</span>', unsafe_allow_html=True)
                 if st.button("🔄 Refresh payment status"):
                     st.rerun()
             elif status == "COMPLETE":
-                st.success("Payment confirmed — credits added!")
+                st.success("Payment verified — credits added!")
                 del st.session_state["pending_api_ref"]
                 st.balloons()
                 st.rerun()
             elif status == "FAILED":
-                st.error("Payment failed or was cancelled. Please try again.")
+                st.error("This payment could not be verified. Please contact support with your M-Pesa code.")
                 del st.session_state["pending_api_ref"]
 
 

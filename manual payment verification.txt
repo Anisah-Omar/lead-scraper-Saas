@@ -1,0 +1,57 @@
+HOW TO VERIFY A POCHI LA BIASHARA PAYMENT AND CREDIT THE CUSTOMER
+====================================================================
+
+When a customer submits a payment in the app, it creates a row in the
+`transactions` table with status = 'PENDING' and their M-Pesa code stored.
+
+STEP 1 — Check your M-Pesa statement / SMS
+-------------------------------------------
+Confirm the confirmation code they submitted actually appears in your
+M-Pesa transaction history, for the expected amount, on Till 0796011042.
+
+STEP 2 — Look up the pending transaction in Supabase
+-------------------------------------------------------
+Go to Supabase -> Table Editor -> transactions, or run:
+
+    SELECT * FROM transactions
+    WHERE mpesa_code = 'PASTE_THE_CODE_HERE'
+    AND status = 'PENDING';
+
+Confirm the amount_kes matches what actually landed in your M-Pesa.
+
+STEP 3a — If it's genuine, mark it complete and credit the wallet
+--------------------------------------------------------------------
+Run this in Supabase's SQL Editor, replacing the code:
+
+    UPDATE transactions
+    SET status = 'COMPLETE', completed_at = NOW()
+    WHERE mpesa_code = 'PASTE_THE_CODE_HERE' AND status = 'PENDING';
+
+    UPDATE users
+    SET credits = credits + (
+        SELECT bundle_credits FROM transactions WHERE mpesa_code = 'PASTE_THE_CODE_HERE'
+    )
+    WHERE email = (
+        SELECT email FROM transactions WHERE mpesa_code = 'PASTE_THE_CODE_HERE'
+    );
+
+Run both statements together (select all, run once). The customer will
+see "Payment verified — credits added!" next time they click Refresh in
+the app sidebar.
+
+STEP 3b — If the code doesn't check out (fake, wrong amount, duplicate)
+--------------------------------------------------------------------------
+    UPDATE transactions
+    SET status = 'FAILED', completed_at = NOW()
+    WHERE mpesa_code = 'PASTE_THE_CODE_HERE' AND status = 'PENDING';
+
+WATCH OUT FOR
+--------------
+- The same mpesa_code being submitted twice (someone reusing a code from
+  a previous top-up to try to get free credits). The WHERE status =
+  'PENDING' clause above prevents double-crediting the *same* row, but
+  you should still visually scan for a code that already appears once
+  as COMPLETE before approving a second submission with that code.
+- Amount mismatches — someone paying KES 500 but claiming the KES 4,500
+  bundle in the app. Always check amount_kes against your real M-Pesa
+  statement before running the UPDATE.
