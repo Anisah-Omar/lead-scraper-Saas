@@ -41,7 +41,7 @@ INTASEND_SANDBOX_TOKEN = st.secrets.get("intasend", {}).get("secret_key", "")
 # must rely on the /mpesa/webhook confirmation in the backend instead.
 # Set this to False once INTASEND_SANDBOX_TOKEN is a real token and the
 # webhook is wired up in the IntaSend dashboard.
-DEMO_MODE = True
+DEMO_MODE = False
 
 CREDIT_BUNDLES = {
     "Starter Bundle — 100 Credits (KES 500)": {"credits": 100, "amount": 500},
