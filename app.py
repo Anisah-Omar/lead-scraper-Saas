@@ -844,13 +844,13 @@ def render_workspace():
     with input_col2:
         location_city = st.text_input("Location City", placeholder="e.g. Nairobi")
 
-    result_limit = st.slider(
-        "Result limit",
-        min_value=10,
-        max_value=VERCEL_SERVER_MAX_RESULTS,
-        value=VERCEL_SERVER_MAX_RESULTS,
-        step=5,
-    )
+    # result_limit = st.slider(
+    #     "Result limit",
+    #     min_value=10,
+    #     max_value=VERCEL_SERVER_MAX_RESULTS,
+    #     value=VERCEL_SERVER_MAX_RESULTS,
+    #     step=5,
+    # )
 
     st.markdown(
         f'<span class="lp-badge">Cost: 1 credit per extraction · Balance: {current_credits} credits</span>',
