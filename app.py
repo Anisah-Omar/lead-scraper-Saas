@@ -612,6 +612,7 @@ def fetch_leads_from_vercel(keyword: str, location: str, limit: int):
         "summary": "Description Snippet",
         "domain": "Core Domain Address",
         "core_domain": "Core Domain Address",
+        "email": "Contact Email",
     }
     df = df.rename(columns=rename_map)
 
@@ -620,6 +621,7 @@ def fetch_leads_from_vercel(keyword: str, location: str, limit: int):
         "Website URL",
         "Description Snippet",
         "Core Domain Address",
+        "Contact Email",
     ]
     for column in desired_columns:
         if column not in df.columns:
