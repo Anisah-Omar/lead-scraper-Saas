@@ -1,0 +1,15 @@
+# Save this as .streamlit/config.toml — SAME folder as secrets.toml,
+# i.e. next to app.py:
+#
+#   your-project/
+#   ├── app.py
+#   └── .streamlit/
+#       ├── secrets.toml
+#       └── config.toml   <-- this file
+#
+# This removes the GitHub icon, "Fork", "View app source", and "Deploy"
+# button from the top-right corner for everyone viewing the app —
+# including you, unless you're logged in as the app's owner/admin.
+
+[client]
+toolbarMode = "minimal"
